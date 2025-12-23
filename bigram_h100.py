@@ -172,50 +172,66 @@ class BigramLanguageModel(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
 
-# --- Initialization ---
-model = BigramLanguageModel()
-model.to(device)
+# --- Main Execution Block ---
+if __name__ == "__main__":
+    # --- Initialization ---
+    model = BigramLanguageModel()
+    model.to(device)
 
-# --- SPEED OPTIMIZATION: torch.compile ---
-# Optimized for H100. Note: This takes 1-2 mins to "warm up" during the first few steps.
-if hasattr(torch, 'compile') and device == 'cuda':
-    print("Compiling model for extra speedup...")
-    model = torch.compile(model)
+    # --- SPEED OPTIMIZATION: torch.compile ---
+    if hasattr(torch, 'compile') and device == 'cuda':
+        print("Compiling model for extra speedup...")
+        model = torch.compile(model)
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
-# --- Training Loop ---
-start_time = time.time()
-print(f"Training started at {time.ctime()}...")
+    # --- Training Loop ---
+    start_time = time.time()
+    print(f"Training started at {time.ctime()}...")
+    print(f"Hyperparameters: Batch={batch_size}, Block={block_size}, Embed={n_embed}, Blocks={num_blocks}")
+    
+    try:
+        for iter in range(max_iters):
 
-for iter in range(max_iters):
+            if iter % eval_interval == 0 or iter == max_iters - 1:
+                losses = estimate_loss(model)
+                print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+                
+                # Intermediate Checkpoint Saving
+                checkpoint_path = f'checkpoint_iter_{iter}.pth'
+                torch.save(model.state_dict(), checkpoint_path)
+                print(f"  > Saved checkpoint to {checkpoint_path}")
 
-    if iter % eval_interval == 0 or iter == max_iters - 1:
-        losses = estimate_loss(model)
-        print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+            xb, yb = get_batch('train')
 
-    xb, yb = get_batch('train')
+            # Mixed Precision Training (using BFloat16 for H100)
+            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=(device == 'cuda')):
+                logits, loss = model(xb, yb)
 
-    # Mixed Precision Training (using BFloat16 for H100)
-    with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=(device == 'cuda')):
-        logits, loss = model(xb, yb)
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
 
-    optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    optimizer.step()
+    except Exception as e:
+        print(f"\n[!] Training interrupted or crashed: {e}")
+        print("Attempting to save emergency checkpoint...")
+        torch.save(model.state_dict(), 'emergency_model_save.pth')
+        print("Emergency save successful.")
 
-end_time = time.time()
-print(f"Total training time: {end_time - start_time:.2f} seconds")
+    end_time = time.time()
+    print(f"Total training time: {end_time - start_time:.2f} seconds")
 
-# --- Generation and Saving ---
-model.eval()
-context = torch.zeros((1, 1), dtype=torch.long, device=device)
-print("\n--- Final Generation Sample ---")
-print(decode(model.generate(context, max_new_tokens=500)[0].tolist()))
-print("-------------------------------\n")
+    # --- Generation and Final Saving ---
+    model.eval()
+    context = torch.zeros((1, 1), dtype=torch.long, device=device)
+    print("\n--- Final Generation Sample ---")
+    with torch.no_grad():
+        generated_idx = model.generate(context, max_new_tokens=500)
+        print(decode(generated_idx[0].tolist()))
+    print("-------------------------------\n")
 
-save_path = 'shakespeare_h100_final.pth'
-torch.save(model.state_dict(), save_path)
-print(f"Model weights saved to {save_path}")
-print("To download this file from Lambda Labs to your local machine, run:")
-print(f"scp labs@<YOUR_VM_IP>:/home/labs/{save_path} ./")
+    save_path = 'shakespeare_h100_final.pth'
+    torch.save(model.state_dict(), save_path)
+    print(f"Model weights saved to {save_path}")
+    print("\n[Final Step] To download this file from Lambda Labs to your local machine, run:")
+    print(f"scp ubuntu@<YOUR_VM_IP>:/home/ubuntu/{save_path} ./")
