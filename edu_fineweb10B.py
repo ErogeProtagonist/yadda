@@ -13,15 +13,15 @@ import tiktoken
 from datasets import load_dataset
 from tqdm import tqdm
 
+import argparse
+
 # --- Config ---
-DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), "edu_fineweb10B")
 SHARD_SIZE = int(1e8) # 100M tokens per shard
 TOKENIZER_NAME = "gpt2"
 DTYPE = np.uint16 
 REMOTE_NAME = "sample-10BT" # The 10 billion token subset
 
-# 1. Setup
-os.makedirs(DATA_CACHE_DIR, exist_ok=True)
+# Setup Tokenizer
 enc = tiktoken.get_encoding(TOKENIZER_NAME)
 eot_token = enc.eot_token
 
@@ -40,28 +40,25 @@ def write_shard(filename, tokens_np):
     with open(filename, "wb") as f:
         f.write(tokens_np.tobytes())
 
-def prepare_data():
+def prepare_data(output_dir):
     print(f"Loading dataset '{REMOTE_NAME}' from FineWeb-Edu...")
+    os.makedirs(output_dir, exist_ok=True)
+    
     # Streaming mode handles massive datasets without crashing RAM
     fw = load_dataset("HuggingFaceFW/fineweb-edu", name=REMOTE_NAME, split="train", streaming=True)
 
     # multiprocessing pool for tokenization
-    # Note: Using half the cores is usually enough as I/O is the bottleneck
     n_procs = max(1, os.cpu_count() // 2)
     
     with mp.Pool(n_procs) as pool:
         shard_idx = 0
-        # Preallocate buffer for current shard (100M tokens = ~200MB)
         all_tokens_np = np.empty((SHARD_SIZE,), dtype=DTYPE)
         token_count = 0
         progress_bar = None
         
         print(f"Starting parallel processing on {n_procs} cores...")
         
-        # We iterate over documents in chunks to keep the pool busy
         for tokens in pool.imap(tokenize, fw, chunksize=16):
-            
-            # Check if current document fits in this shard
             if token_count + len(tokens) < SHARD_SIZE:
                 all_tokens_np[token_count:token_count+len(tokens)] = tokens
                 token_count += len(tokens)
@@ -69,14 +66,13 @@ def prepare_data():
                     progress_bar = tqdm(total=SHARD_SIZE, unit="tokens", desc=f"Shard {shard_idx}")
                 progress_bar.update(len(tokens))
             else:
-                # This doc overflows the shard. Split it.
                 remainder = SHARD_SIZE - token_count
                 progress_bar.update(remainder)
                 all_tokens_np[token_count:SHARD_SIZE] = tokens[:remainder]
                 
                 # Write completed shard
                 split = "val" if shard_idx == 0 else "train"
-                filename = os.path.join(DATA_CACHE_DIR, f"edufineweb_{split}_{shard_idx:06d}.bin")
+                filename = os.path.join(output_dir, f"edufineweb_{split}_{shard_idx:06d}.bin")
                 write_shard(filename, all_tokens_np)
                 
                 shard_idx += 1
@@ -90,10 +86,14 @@ def prepare_data():
         # Write final shard
         if token_count > 0:
             split = "val" if shard_idx == 0 else "train"
-            filename = os.path.join(DATA_CACHE_DIR, f"edufineweb_{split}_{shard_idx:06d}.bin")
+            filename = os.path.join(output_dir, f"edufineweb_{split}_{shard_idx:06d}.bin")
             write_shard(filename, all_tokens_np[:token_count])
 
-    print("\nData preparation complete!")
+    print(f"\nData preparation complete! Files saved to: {output_dir}")
 
 if __name__ == "__main__":
-    prepare_data()
+    parser = argparse.ArgumentParser(description="FineWeb-Edu Data Prep")
+    parser.add_argument("--output_dir", type=str, default="edu_fineweb10B", help="Directory to save shards")
+    args = parser.parse_args()
+    
+    prepare_data(args.output_dir)
