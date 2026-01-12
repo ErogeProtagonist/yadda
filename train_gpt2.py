@@ -488,7 +488,7 @@ for step in range(max_steps):
     # do one step of the optimization
     model.train()
     optimizer.zero_grad()
-    loss_accum = 0.0
+    loss_accum = torch.zeros(1, device=device)
     for micro_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
