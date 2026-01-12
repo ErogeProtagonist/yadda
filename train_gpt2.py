@@ -6,7 +6,11 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from hellaswag import render_example, iterate_examples
+try:
+    from hellaswag import render_example, iterate_examples
+    HAS_HELLASWAG = True
+except ImportError:
+    HAS_HELLASWAG = False
 # -----------------------------------------------------------------------------
 
 class CausalSelfAttention(nn.Module):
@@ -418,7 +422,7 @@ for step in range(max_steps):
                 torch.save(checkpoint, checkpoint_path)
 
     # once in a while evaluate hellaswag
-    if (step % 250 == 0 or last_step) and (not use_compile):
+    if HAS_HELLASWAG and (step % 250 == 0 or last_step) and (not use_compile):
         num_correct_norm = 0
         num_total = 0
         for i, example in enumerate(iterate_examples("val")):
@@ -449,6 +453,8 @@ for step in range(max_steps):
             print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
             with open(log_file, "a") as f:
                 f.write(f"{step} hella {acc_norm:.4f}\n")
+    elif not HAS_HELLASWAG and master_process and step % 250 == 0:
+        print("HellaSwag evaluation skipped (hellaswag.py not found).")
 
     # once in a while generate from the model (except step 0, which is noise)
     if ((step > 0 and step % 250 == 0) or last_step) and (not use_compile):
