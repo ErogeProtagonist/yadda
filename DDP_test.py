@@ -81,8 +81,10 @@ class ShardedDataLoader:
         path = self.shards[self.current_shard_idx]
         # Using memmap for zero-latency loading
         self.tokens_np = np.memmap(path, dtype=np.uint16, mode='r')
-        self.tokens = torch.from_numpy(self.tokens_np.astype(np.int32))
-        self.current_pos = 0 # No need to offset if each rank picks a different shard
+        # We cast to .long() (int64) because PyTorch's cross_entropy 
+        # loss function requires it for indices on CUDA.
+        self.tokens = torch.from_numpy(self.tokens_np.astype(np.int64))
+        self.current_pos = 0 
         
         # Tokenizer check: The first token of a shard should usually be 50256 (EOT) if prep script is correct
         if self.current_pos == 0 and self.tokens[0] != 50256:

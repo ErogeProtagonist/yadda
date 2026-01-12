@@ -209,7 +209,8 @@ def load_tokens(filename):
     # We use memmap to 'look' at the file on disk without loading it into RAM.
     # The OS will handle the I/O in the background (zero-latency for the GPU).
     npt = np.memmap(filename, dtype=np.uint16, mode='r')
-    ptt = torch.from_numpy(npt.astype(np.int32)) # Convert to int32 for PyTorch embedding layers
+    # Use int64 (long) for PyTorch indexes and cross-entropy compatibility.
+    ptt = torch.from_numpy(npt.astype(np.int64)) 
     return ptt
 
 class DataLoaderLite:
