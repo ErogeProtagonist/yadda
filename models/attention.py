@@ -1,0 +1,488 @@
+"""
+Attention Implementations for Hybrid SWA and MLA Transformers.
+
+This module provides 4 attention variants:
+- NaiveHybridAttention: Portable inference for Hybrid model (RTX 3090)
+- FlexHybridAttention: Optimized training for Hybrid model (H100)  
+- NaiveMLAttention: Portable inference for MLA model (RTX 3090)
+- FlashMLAttention: Optimized training for MLA model (H100)
+
+The factory function `get_attention()` automatically selects the best
+implementation based on hardware and mode.
+"""
+
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional, Tuple
+
+from .config import ModelConfig
+from .rope import RotaryEmbedding, apply_rotary_pos_emb, apply_rotary_pos_emb_single
+
+
+# Check for optimized kernel availability
+try:
+    from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+    FLEX_AVAILABLE = True
+except ImportError:
+    FLEX_AVAILABLE = False
+    
+try:
+    from flash_mla import flash_mla_attention
+    FLASH_MLA_AVAILABLE = True
+except ImportError:
+    FLASH_MLA_AVAILABLE = False
+
+
+# ============================================================================
+# HYBRID ATTENTION IMPLEMENTATIONS
+# ============================================================================
+
+class NaiveHybridAttention(nn.Module):
+    """
+    Naive PyTorch implementation of Hybrid Sliding Window + Global attention.
+    
+    Works on any hardware (RTX 3090, CPU, etc.) using standard operations.
+    Uses F.scaled_dot_product_attention with explicit masks.
+    """
+    
+    def __init__(self, config: ModelConfig, layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.is_global = config.is_global_layer(layer_idx)
+        
+        self.n_heads = config.n_heads
+        self.head_dim = config.head_dim
+        self.window_size = config.window_size
+        
+        # QKV projection (combined for efficiency)
+        self.qkv_proj = nn.Linear(config.d_model, 3 * config.d_model, bias=False)
+        self.out_proj = nn.Linear(config.d_model, config.d_model, bias=False)
+        
+        # RoPE
+        self.rope = RotaryEmbedding(self.head_dim, config.block_size, config.rope_base)
+        
+        # Mark output projection for scaled init
+        self.out_proj.RESIDUAL_SCALE_INIT = True
+        
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        """
+        Args:
+            x: Input tensor (batch, seq_len, d_model)
+            position_ids: Position indices for RoPE
+            kv_cache: Cached (keys, values) for generation
+            use_cache: Whether to return updated cache
+            
+        Returns:
+            output: Attention output (batch, seq_len, d_model)
+            new_cache: Updated KV cache if use_cache=True
+        """
+        B, S, D = x.shape
+        
+        # Project to QKV
+        qkv = self.qkv_proj(x)
+        q, k, v = qkv.chunk(3, dim=-1)
+        
+        # Reshape for multi-head attention: (B, S, D) -> (B, nh, S, hd)
+        q = q.view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        
+        # Apply RoPE
+        q, k = self.rope(q, k, position_ids)
+        
+        # Handle KV cache for generation
+        # CRITICAL: For local (SWA) layers, we implement a ROLLING BUFFER
+        # that only keeps the last window_size tokens. This is where the
+        # memory savings of SWA come from during inference.
+        if kv_cache is not None:
+            past_k, past_v = kv_cache
+            k = torch.cat([past_k, k], dim=2)
+            v = torch.cat([past_v, v], dim=2)
+        
+        if use_cache:
+            if not self.is_global:
+                # LOCAL LAYER: Cap cache at window_size (rolling buffer)
+                # This is the key memory optimization for SWA!
+                if k.shape[2] > self.window_size:
+                    k_cache = k[:, :, -self.window_size:, :]
+                    v_cache = v[:, :, -self.window_size:, :]
+                else:
+                    k_cache = k
+                    v_cache = v
+                new_cache = (k_cache, v_cache)
+            else:
+                # GLOBAL LAYER: Keep full cache
+                new_cache = (k, v)
+        else:
+            new_cache = None
+        
+        # For local layers, apply sliding window; for global, use full causal
+        if self.is_global:
+            # Global attention: standard causal
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            # Sliding window: create banded mask
+            kv_len = k.shape[2]
+            q_len = q.shape[2]
+            
+            # Build sliding window mask
+            mask = self._make_sliding_window_mask(q_len, kv_len, x.device)
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        
+        # Reshape and project output
+        out = out.transpose(1, 2).contiguous().view(B, S, D)
+        out = self.out_proj(out)
+        
+        return out, new_cache
+    
+    def _make_sliding_window_mask(
+        self, q_len: int, kv_len: int, device: torch.device
+    ) -> torch.Tensor:
+        """Create a causal sliding window attention mask."""
+        # Start with causal mask (upper triangle = -inf)
+        mask = torch.full((q_len, kv_len), float("-inf"), device=device)
+        
+        # Allow attention to positions within window
+        for i in range(q_len):
+            # Position in full sequence (for KV cache scenarios)
+            abs_pos = kv_len - q_len + i
+            start = max(0, abs_pos - self.window_size + 1)
+            end = abs_pos + 1
+            mask[i, start:end] = 0.0
+            
+        return mask
+
+
+class FlexHybridAttention(nn.Module):
+    """
+    Optimized Hybrid attention using torch flex_attention API.
+    
+    Requires H100/A100 with PyTorch 2.5+ and compiled kernels.
+    Falls back to NaiveHybridAttention if flex_attention unavailable.
+    """
+    
+    def __init__(self, config: ModelConfig, layer_idx: int):
+        super().__init__()
+        
+        if not FLEX_AVAILABLE:
+            raise RuntimeError("flex_attention not available. Use NaiveHybridAttention.")
+            
+        self.config = config
+        self.layer_idx = layer_idx
+        self.is_global = config.is_global_layer(layer_idx)
+        
+        self.n_heads = config.n_heads
+        self.head_dim = config.head_dim
+        self.window_size = config.window_size
+        
+        self.qkv_proj = nn.Linear(config.d_model, 3 * config.d_model, bias=False)
+        self.out_proj = nn.Linear(config.d_model, config.d_model, bias=False)
+        
+        self.rope = RotaryEmbedding(self.head_dim, config.block_size, config.rope_base)
+        self.out_proj.RESIDUAL_SCALE_INIT = True
+        
+        # Pre-compile the block mask function for this layer
+        if not self.is_global:
+            self._block_mask_fn = self._create_sliding_window_mask_fn()
+        
+    def _create_sliding_window_mask_fn(self):
+        """Create a mask function for flex_attention."""
+        window = self.window_size
+        
+        def sliding_window_mask(b, h, q_idx, kv_idx):
+            # Causal constraint: q_idx >= kv_idx
+            # Window constraint: q_idx - kv_idx < window_size
+            return (q_idx >= kv_idx) & (q_idx - kv_idx < window)
+        
+        return sliding_window_mask
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        B, S, D = x.shape
+        
+        qkv = self.qkv_proj(x)
+        q, k, v = qkv.chunk(3, dim=-1)
+        
+        q = q.view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        
+        q, k = self.rope(q, k, position_ids)
+        
+        # Note: flex_attention is primarily for training (no KV cache)
+        # For generation, fall back to naive with rolling buffer
+        if kv_cache is not None or use_cache:
+            # Fallback to standard SDPA for generation
+            if kv_cache is not None:
+                past_k, past_v = kv_cache
+                k = torch.cat([past_k, k], dim=2)
+                v = torch.cat([past_v, v], dim=2)
+            
+            # Implement rolling buffer for local layers
+            if use_cache:
+                if not self.is_global:
+                    # LOCAL LAYER: Cap cache at window_size
+                    if k.shape[2] > self.window_size:
+                        k_cache = k[:, :, -self.window_size:, :]
+                        v_cache = v[:, :, -self.window_size:, :]
+                    else:
+                        k_cache = k
+                        v_cache = v
+                    new_cache = (k_cache, v_cache)
+                else:
+                    # GLOBAL LAYER: Keep full cache
+                    new_cache = (k, v)
+            else:
+                new_cache = None
+            
+            if self.is_global:
+                out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            else:
+                kv_len = k.shape[2]
+                mask = self._make_sliding_window_mask_fallback(S, kv_len, x.device)
+                out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        else:
+            # Training path: use flex_attention
+            new_cache = None
+            
+            if self.is_global:
+                # Full causal attention
+                out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            else:
+                # Use flex_attention with compiled mask
+                block_mask = create_block_mask(
+                    self._block_mask_fn, 
+                    B=None, H=None, 
+                    Q_LEN=S, KV_LEN=S
+                )
+                out = flex_attention(q, k, v, block_mask=block_mask)
+        
+        out = out.transpose(1, 2).contiguous().view(B, S, D)
+        out = self.out_proj(out)
+        
+        return out, new_cache
+    
+    def _make_sliding_window_mask_fallback(self, q_len, kv_len, device):
+        """Fallback mask for generation mode."""
+        mask = torch.full((q_len, kv_len), float("-inf"), device=device)
+        for i in range(q_len):
+            abs_pos = kv_len - q_len + i
+            start = max(0, abs_pos - self.window_size + 1)
+            end = abs_pos + 1
+            mask[i, start:end] = 0.0
+        return mask
+
+
+# ============================================================================
+# MLA (Multi-Head Latent Attention) IMPLEMENTATIONS
+# ============================================================================
+
+class NaiveMLAttention(nn.Module):
+    """
+    Naive PyTorch implementation of Multi-Head Latent Attention.
+    
+    Implements the DeepSeek-V2/V3 MLA mechanism with:
+    - Low-rank KV compression into latent vector c_KV
+    - Decoupled RoPE for positional information
+    - Standard matmul operations (no FlashMLA kernel)
+    
+    Works on any hardware (RTX 3090, CPU, etc.).
+    """
+    
+    def __init__(self, config: ModelConfig, layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        
+        self.n_heads = config.n_heads
+        self.head_dim = config.head_dim
+        self.d_model = config.d_model
+        self.kv_lora_rank = config.kv_lora_rank  # d_c (latent dimension)
+        self.rope_dim = config.rope_dim           # d_R (RoPE dimension)
+        
+        # Query projection (full dimension)
+        self.q_proj = nn.Linear(config.d_model, config.n_heads * config.head_dim, bias=False)
+        
+        # Decoupled Query RoPE projection
+        self.q_rope_proj = nn.Linear(config.d_model, config.n_heads * self.rope_dim, bias=False)
+        
+        # KV down-projection to latent space
+        self.kv_down_proj = nn.Linear(config.d_model, self.kv_lora_rank, bias=False)
+        
+        # KV up-projections from latent space
+        self.k_up_proj = nn.Linear(self.kv_lora_rank, config.n_heads * config.head_dim, bias=False)
+        self.v_up_proj = nn.Linear(self.kv_lora_rank, config.n_heads * config.head_dim, bias=False)
+        
+        # Decoupled Key RoPE projection (shared across heads in DeepSeek style)
+        self.k_rope_proj = nn.Linear(config.d_model, self.rope_dim, bias=False)
+        
+        # Output projection
+        self.out_proj = nn.Linear(config.d_model, config.d_model, bias=False)
+        self.out_proj.RESIDUAL_SCALE_INIT = True
+        
+        # RoPE for the decoupled positional embeddings
+        self.rope_content = RotaryEmbedding(config.head_dim, config.block_size, config.rope_base)
+        self.rope_decoupled = RotaryEmbedding(self.rope_dim, config.block_size, config.rope_base)
+        
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        """
+        Args:
+            x: Input (batch, seq_len, d_model)
+            kv_cache: Cached (c_KV, k_rope) for generation
+            
+        Returns:
+            output, new_cache
+        """
+        B, S, D = x.shape
+        
+        # === Query Path ===
+        # Content query
+        q_content = self.q_proj(x)  # (B, S, n_heads * head_dim)
+        q_content = q_content.view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        
+        # Decoupled RoPE query
+        q_rope = self.q_rope_proj(x)  # (B, S, n_heads * rope_dim)
+        q_rope = q_rope.view(B, S, self.n_heads, self.rope_dim).transpose(1, 2)
+        q_rope = self.rope_decoupled.forward_single(q_rope, position_ids)
+        
+        # === Key-Value Path ===
+        # Compress to latent space
+        c_kv = self.kv_down_proj(x)  # (B, S, kv_lora_rank)
+        
+        # Decoupled RoPE key (shared across heads)
+        k_rope = self.k_rope_proj(x)  # (B, S, rope_dim)
+        k_rope = k_rope.unsqueeze(2)  # (B, S, 1, rope_dim) for broadcasting
+        k_rope = k_rope.transpose(1, 2)  # (B, 1, S, rope_dim)
+        k_rope = self.rope_decoupled.forward_single(k_rope, position_ids)
+        k_rope = k_rope.expand(-1, self.n_heads, -1, -1)  # (B, n_heads, S, rope_dim)
+        
+        # Handle KV cache
+        # In MLA, we cache the compressed c_kv and the RoPE key
+        if kv_cache is not None:
+            past_c_kv, past_k_rope = kv_cache
+            c_kv = torch.cat([past_c_kv, c_kv], dim=1)
+            k_rope = torch.cat([past_k_rope, k_rope], dim=2)
+        
+        new_cache = (c_kv, k_rope) if use_cache else None
+        
+        # Up-project keys and values from latent space
+        k_content = self.k_up_proj(c_kv)  # (B, S_kv, n_heads * head_dim)
+        k_content = k_content.view(B, -1, self.n_heads, self.head_dim).transpose(1, 2)
+        
+        v = self.v_up_proj(c_kv)  # (B, S_kv, n_heads * head_dim)
+        v = v.view(B, -1, self.n_heads, self.head_dim).transpose(1, 2)
+        
+        # === Attention Computation ===
+        # Concatenate content and RoPE dimensions for query and key
+        # q_full: (B, n_heads, S_q, head_dim + rope_dim)
+        # k_full: (B, n_heads, S_kv, head_dim + rope_dim)
+        q_full = torch.cat([q_content, q_rope], dim=-1)
+        k_full = torch.cat([k_content, k_rope], dim=-1)
+        
+        # Compute attention scores
+        scale = 1.0 / math.sqrt(self.head_dim + self.rope_dim)
+        attn_weights = torch.matmul(q_full, k_full.transpose(-1, -2)) * scale
+        
+        # Apply causal mask
+        S_q = q_full.shape[2]
+        S_kv = k_full.shape[2]
+        causal_mask = torch.triu(
+            torch.full((S_q, S_kv), float("-inf"), device=x.device), 
+            diagonal=S_kv - S_q + 1
+        )
+        attn_weights = attn_weights + causal_mask
+        
+        # Softmax and apply to values
+        attn_weights = F.softmax(attn_weights, dim=-1)
+        out = torch.matmul(attn_weights, v)
+        
+        # Reshape and project output
+        out = out.transpose(1, 2).contiguous().view(B, S, D)
+        out = self.out_proj(out)
+        
+        return out, new_cache
+
+
+class FlashMLAttention(nn.Module):
+    """
+    Optimized MLA using FlashMLA kernel (requires H100/H800).
+    
+    Falls back to NaiveMLAttention if flash_mla is not available.
+    """
+    
+    def __init__(self, config: ModelConfig, layer_idx: int):
+        super().__init__()
+        
+        if not FLASH_MLA_AVAILABLE:
+            raise RuntimeError("flash_mla not available. Use NaiveMLAttention.")
+        
+        # For now, just wrap naive implementation
+        # Full FlashMLA integration requires the flash_mla package
+        self.naive_impl = NaiveMLAttention(config, layer_idx)
+        
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        # TODO: Implement actual FlashMLA kernel call when package is available
+        # For now, use naive implementation
+        return self.naive_impl(x, position_ids, kv_cache, use_cache)
+
+
+# ============================================================================
+# FACTORY FUNCTION
+# ============================================================================
+
+def get_attention(
+    config: ModelConfig, 
+    layer_idx: int, 
+    mode: str = "train"
+) -> nn.Module:
+    """
+    Factory function to get the appropriate attention implementation.
+    
+    Args:
+        config: Model configuration
+        layer_idx: Layer index (for Hybrid layer type selection)
+        mode: "train" (use optimized kernels) or "inference" (use naive)
+        
+    Returns:
+        Attention module instance
+    """
+    if config.model_type == "hybrid":
+        if mode == "train" and FLEX_AVAILABLE:
+            return FlexHybridAttention(config, layer_idx)
+        else:
+            return NaiveHybridAttention(config, layer_idx)
+    
+    elif config.model_type == "mla":
+        if mode == "train" and FLASH_MLA_AVAILABLE:
+            return FlashMLAttention(config, layer_idx)
+        else:
+            return NaiveMLAttention(config, layer_idx)
+    
+    else:
+        raise ValueError(f"Unknown model type: {config.model_type}")
