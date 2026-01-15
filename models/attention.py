@@ -29,7 +29,7 @@ except ImportError:
     FLEX_AVAILABLE = False
     
 try:
-    from flash_mla import flash_mla_attention
+    from flash_mla import flash_mla_with_kvcache, get_mla_metadata
     FLASH_MLA_AVAILABLE = True
 except ImportError:
     FLASH_MLA_AVAILABLE = False
