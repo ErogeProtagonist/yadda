@@ -1,0 +1,14 @@
+# Git Ignore
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Models and Data
+*.bin
+*.pt
+*.pth
+log/
+edu_fineweb10B/
+vocab.bpe
+encoder.json
+.DS_Store

@@ -222,7 +222,20 @@ class Transformer(nn.Module):
         
         for layer_idx, layer in enumerate(self.layers):
             layer_cache = kv_cache[layer_idx] if kv_cache is not None else None
-            x, layer_new_cache = layer(x, position_ids, layer_cache, use_cache)
+            
+            # Gradient Checkpointing (Activation Checkpointing)
+            # Only use during training (no cache) and if gradients are required
+            if self.training and not use_cache and torch.is_grad_enabled():
+                x, layer_new_cache = torch.utils.checkpoint.checkpoint(
+                    layer, 
+                    x, 
+                    position_ids, 
+                    layer_cache, 
+                    use_cache,
+                    use_reentrant=False
+                )
+            else:
+                x, layer_new_cache = layer(x, position_ids, layer_cache, use_cache)
             
             if use_cache:
                 new_cache.append(layer_new_cache)
