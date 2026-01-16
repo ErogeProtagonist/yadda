@@ -23,7 +23,12 @@ from .rope import RotaryEmbedding, apply_rotary_pos_emb, apply_rotary_pos_emb_si
 
 
 # Optimized kernels are now built-in via SDPA (torch 2.0+)
-FLEX_AVAILABLE = hasattr(torch.nn.attention, "flex_attention")
+try:
+    import torch.nn.attention.flex
+    FLEX_AVAILABLE = hasattr(torch.nn.attention.flex, "flex_attention")
+except (ImportError, AttributeError):
+    FLEX_AVAILABLE = False
+
 FLASH_MLA_AVAILABLE = True  # We implemented SDPA version of FlashMLA
 
 

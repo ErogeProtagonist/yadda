@@ -204,6 +204,10 @@ def main():
     if master_process:
         print(f"\n{'='*60}")
         print(f"Training {args.model_type.upper()} Transformer")
+        from models.attention import FLEX_AVAILABLE, FLASH_MLA_AVAILABLE
+        print(f"Flex attention available: {FLEX_AVAILABLE}")
+        print(f"FlashMLA (SDPA) available: {FLASH_MLA_AVAILABLE}")
+        print(f"Using torch.compile: {args.compile}")
         print(f"{'='*60}\n")
     
     # Select config based on model type
