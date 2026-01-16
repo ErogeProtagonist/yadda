@@ -223,9 +223,11 @@ class Transformer(nn.Module):
         for layer_idx, layer in enumerate(self.layers):
             layer_cache = kv_cache[layer_idx] if kv_cache is not None else None
             
-            # Gradient Checkpointing (Activation Checkpointing)
-            # Only use during training (no cache) and if gradients are required
-            if self.training and not use_cache and torch.is_grad_enabled():
+            # Selective Activation Checkpointing
+            # We checkpoint every even layer (0, 2, 4...) and skip others.
+            # This balances VRAM savings with training speed (less re-computation).
+            do_checkpoint = self.training and not use_cache and torch.is_grad_enabled()
+            if do_checkpoint and (layer_idx % 2 == 0):
                 x, layer_new_cache = torch.utils.checkpoint.checkpoint(
                     layer, 
                     x, 
