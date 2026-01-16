@@ -484,7 +484,7 @@ class FlashMLAttention(nn.Module):
         # 4. SDPA (This triggers FlashAttention-2/3 on H100)
         # DeepSeek scaling: 1 / sqrt(head_dim + rope_dim)
         # SDPA uses 1 / sqrt(last_dim) by default, which is exactly (head_dim + rope_dim)
-        with torch.backends.cuda.sdp_kernel(enable_math=False, enable_flash=True, enable_mem_efficient=True):
+        with torch.nn.attention.sdpa_kernel([torch.nn.attention.SDPBackend.FLASH_ATTENTION, torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION]):
             out = F.scaled_dot_product_attention(
                 q_full, k_full, v, 
                 is_causal=True
