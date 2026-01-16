@@ -734,11 +734,11 @@ def get_attention(
     
     if config.model_type == "hybrid":
         if mode == "train":
-            # Priority: FlashSWA > Flex > Naive
-            if FLASH_ATTN_AVAILABLE:
-                attn_cls = FlashSWAHybridAttention
-            elif FLEX_AVAILABLE:
+            # Priority: Flex > FlashSWA > Naive (flex performs better with cached mask)
+            if FLEX_AVAILABLE:
                 attn_cls = FlexHybridAttention
+            elif FLASH_ATTN_AVAILABLE:
+                attn_cls = FlashSWAHybridAttention
             else:
                 attn_cls = NaiveHybridAttention
         else:
