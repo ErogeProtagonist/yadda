@@ -7,8 +7,11 @@ __pycache__/
 *.bin
 *.pt
 *.pth
+*.pth
 log/
 edu_fineweb10B/
+__MACOSX/
+.DS_Store
 vocab.bpe
 encoder.json
-.DS_Store
+test_result.txt
