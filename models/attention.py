@@ -46,8 +46,10 @@ class NaiveHybridAttention(nn.Module):
     """
     Naive PyTorch implementation of Hybrid Sliding Window + Global attention.
     
-    Works on any hardware (RTX 3090, CPU, etc.) using standard operations.
-    Uses F.scaled_dot_product_attention with explicit masks.
+    Optimized to use:
+    - Cached causal/window masks (avoids CPU loop overhead)
+    - Vectorized mask creation
+    - Explicit SDPA backend selection
     """
     
     def __init__(self, config: ModelConfig, layer_idx: int):
@@ -69,6 +71,9 @@ class NaiveHybridAttention(nn.Module):
         
         # Mark output projection for scaled init
         self.out_proj.RESIDUAL_SCALE_INIT = True
+        
+        # Cache mask for training (fixed block size)
+        self.register_buffer("mask_cache", None, persistent=False)
         
     def forward(
         self,
@@ -104,8 +109,6 @@ class NaiveHybridAttention(nn.Module):
         
         # Handle KV cache for generation
         # CRITICAL: For local (SWA) layers, we implement a ROLLING BUFFER
-        # that only keeps the last window_size tokens. This is where the
-        # memory savings of SWA come from during inference.
         if kv_cache is not None:
             past_k, past_v = kv_cache
             k = torch.cat([past_k, k], dim=2)
@@ -114,7 +117,6 @@ class NaiveHybridAttention(nn.Module):
         if use_cache:
             if not self.is_global:
                 # LOCAL LAYER: Cap cache at window_size (rolling buffer)
-                # This is the key memory optimization for SWA!
                 if k.shape[2] > self.window_size:
                     k_cache = k[:, :, -self.window_size:, :]
                     v_cache = v[:, :, -self.window_size:, :]
@@ -128,18 +130,25 @@ class NaiveHybridAttention(nn.Module):
         else:
             new_cache = None
         
-        # For local layers, apply sliding window; for global, use full causal
+        # Attention Logic
         if self.is_global:
-            # Global attention: standard causal
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            # Global: Standard causal SDPA
+            # We prefer FLASH_ATTENTION for speed on Ampere+
+            with torch.nn.attention.sdpa_kernel([torch.nn.attention.SDPBackend.FLASH_ATTENTION, torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION, torch.nn.attention.SDPBackend.MATH]):
+                out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         else:
-            # Sliding window: create banded mask
+            # Sliding Window
             kv_len = k.shape[2]
             q_len = q.shape[2]
             
-            # Build sliding window mask
-            mask = self._make_sliding_window_mask(q_len, kv_len, x.device)
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+            # Efficiently get or create mask
+            mask = self._get_sliding_window_mask(q_len, kv_len, x.device)
+            
+            # Use SDPA with explicit mask
+            # Note: FlashAttention 2 supports slight window attention via specialized kernels,
+            # but standard sdp_kernel might fall back to efficient_attention or math if mask is dense-ish.
+            with torch.nn.attention.sdpa_kernel([torch.nn.attention.SDPBackend.FLASH_ATTENTION, torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION, torch.nn.attention.SDPBackend.MATH]):
+                out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         
         # Reshape and project output
         out = out.transpose(1, 2).contiguous().view(B, S, D)
@@ -147,20 +156,53 @@ class NaiveHybridAttention(nn.Module):
         
         return out, new_cache
     
-    def _make_sliding_window_mask(
+    def _get_sliding_window_mask(
         self, q_len: int, kv_len: int, device: torch.device
     ) -> torch.Tensor:
-        """Create a causal sliding window attention mask."""
-        # Start with causal mask (upper triangle = -inf)
+        """
+        Get cached mask or create one efficiently using vectorized ops.
+        Avoids slow Python loops.
+        """
+        # 1. Check if we can reuse the cached mask (Training scenario)
+        if self.mask_cache is not None and \
+           self.mask_cache.shape == (q_len, kv_len) and \
+           self.mask_cache.device == device:
+            return self.mask_cache
+            
+        # 2. Vectorized mask creation
+        # Indices: (Q, 1) - (1, KV) gives relative distance
+        # q_idx[i] = i (if q is full seq) or offset+i (if q is chunk)
+        # But for standard forward passes, q is aligned at end of kv usually?
+        
+        # Assumption: In standard causal attention (train or inference):
+        # The query tokens Q[0..q_len] align with Keys K[kv_len-q_len .. kv_len]
+        # i.e. the last q_len keys are the ones matching Q
+        
+        # Construct absolute positions
+        # KV indices: 0, 1, ..., kv_len-1
+        # Q indices:  kv_len-q_len, ..., kv_len-1
+        
+        kv_indices = torch.arange(kv_len, device=device).unsqueeze(0)  # (1, KV)
+        q_indices = torch.arange(kv_len - q_len, kv_len, device=device).unsqueeze(1) # (Q, 1)
+        
+        diff = q_indices - kv_indices
+        
+        # Mask conditions:
+        # 1. Causal: q >= k (diff >= 0)
+        # 2. Window: q - k < window (diff < window)
+        # Valid: 0 <= diff < window
+        
+        # Create mask initialized to -inf
         mask = torch.full((q_len, kv_len), float("-inf"), device=device)
         
-        # Allow attention to positions within window
-        for i in range(q_len):
-            # Position in full sequence (for KV cache scenarios)
-            abs_pos = kv_len - q_len + i
-            start = max(0, abs_pos - self.window_size + 1)
-            end = abs_pos + 1
-            mask[i, start:end] = 0.0
+        # Set valid positions to 0.0
+        # This is VASTLY faster than a python loop for 2048x2048
+        valid_mask = (diff >= 0) & (diff < self.window_size)
+        mask.masked_fill_(valid_mask, 0.0)
+        
+        # Cache it if it matches block size (typical training case)
+        if q_len == self.config.block_size and kv_len == self.config.block_size:
+            self.mask_cache = mask
             
         return mask
 

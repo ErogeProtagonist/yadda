@@ -55,17 +55,21 @@ class SwiGLU(nn.Module):
         super().__init__()
         hidden_dim = config.ffn_hidden_dim
         
-        # Gate and up projections (can be fused into one matmul)
-        self.gate_proj = nn.Linear(config.d_model, hidden_dim, bias=False)
-        self.up_proj = nn.Linear(config.d_model, hidden_dim, bias=False)
+        # Fused gate and up projections (d_model -> 2 * hidden_dim)
+        # This reduces kernel overhead vs two separate linears
+        self.w1 = nn.Linear(config.d_model, 2 * hidden_dim, bias=False)
         self.down_proj = nn.Linear(hidden_dim, config.d_model, bias=False)
         
         # Mark down projection for scaled init
         self.down_proj.RESIDUAL_SCALE_INIT = True
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Fused projection and split
+        x_inter = self.w1(x)
+        gate, up = x_inter.chunk(2, dim=-1)
+        
         # SiLU(gate) * up, then project down
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(F.silu(gate) * up)
 
 
 class TransformerBlock(nn.Module):
@@ -223,25 +227,21 @@ class Transformer(nn.Module):
         for layer_idx, layer in enumerate(self.layers):
             layer_cache = kv_cache[layer_idx] if kv_cache is not None else None
             
-            # Activation Checkpointing
-            # Hybrid is memory-intensive, so we use full checkpointing. 
-            # MLA is efficient, so we stick with selective (every 2nd layer).
+            # Selective Activation Checkpointing
+            # We checkpoint every even layer (0, 2, 4...) and skip others.
+            # This balances VRAM savings with training speed (less re-computation).
             do_checkpoint = self.training and not use_cache and torch.is_grad_enabled()
-            if do_checkpoint:
-                if self.config.model_type == "hybrid" or (layer_idx % 2 == 0):
-                    x, layer_new_cache = torch.utils.checkpoint.checkpoint(
-                        layer, 
-                        x, 
-                        position_ids, 
-                        layer_cache, 
-                        use_cache,
-                        use_reentrant=False
-                    )
-                else:
-                    x, layer_new_cache = layer(x, position_ids, layer_cache, use_cache)
+            if do_checkpoint and (layer_idx % 2 == 0):
+                x, layer_new_cache = torch.utils.checkpoint.checkpoint(
+                    layer, 
+                    x, 
+                    position_ids, 
+                    layer_cache, 
+                    use_cache,
+                    use_reentrant=False
+                )
             else:
                 x, layer_new_cache = layer(x, position_ids, layer_cache, use_cache)
-
             
             if use_cache:
                 new_cache.append(layer_new_cache)

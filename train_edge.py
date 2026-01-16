@@ -18,6 +18,8 @@ import os
 import math
 import time
 import argparse
+import threading
+import queue
 from dataclasses import asdict
 
 import torch
@@ -40,9 +42,14 @@ from models.transformer import Transformer
 # =============================================================================
 
 def load_tokens(filename):
-    """Load tokenized data using memory mapping for zero-latency access."""
+    """
+    Load tokenized data.
+    Optimization: Keep as int16/int32 to save RAM, only cast to long when needed.
+    """
     npt = np.memmap(filename, dtype=np.uint16, mode='r')
-    ptt = torch.from_numpy(npt.astype(np.int64))
+    # We cast to int32 because PyTorch doesn't support uint16. 
+    # int32 is 2x smaller than int64 (default for Embedding), saving memory bandwidth.
+    ptt = torch.from_numpy(npt.astype(np.int32))
     return ptt
 
 
@@ -55,6 +62,7 @@ class DataLoaderLite:
         self.process_rank = process_rank
         self.num_processes = num_processes
         self.master_process = master_process
+        self.split = split
         assert split in {'train', 'val'}
 
         # Get shard filenames
@@ -98,6 +106,9 @@ class DataLoaderLite:
             buf = self.tokens[self.current_position : self.current_position + tokens_needed]
             self.current_position += B * T * self.num_processes
             
+        # Cast to long (int64) here, just for the batch
+        buf = buf.to(torch.long)
+        
         x = (buf[:-1]).view(B, T)
         y = (buf[1:]).view(B, T)
         
@@ -108,6 +119,57 @@ class DataLoaderLite:
             self.current_position = self.B * self.T * self.process_rank
             
         return x, y
+
+
+class PrefetchedWrapper:
+    """
+    Wraps a DataLoader to prefetch batches in a background thread.
+    Eliminates I/O wait times.
+    """
+    def __init__(self, loader, device, prefetch_factor=2):
+        self.loader = loader
+        self.device = device
+        self.queue = queue.Queue(maxsize=prefetch_factor)
+        self.stop_event = threading.Event()
+        self.loader_thread = threading.Thread(target=self._worker, daemon=True)
+        self.loader_thread.start()
+        
+    def _worker(self):
+        while not self.stop_event.is_set():
+            try:
+                # Get next batch from CPU loader
+                x, y = self.loader.next_batch()
+                
+                # Pin memory for faster transfer (if on CPU)
+                if x.device.type == 'cpu':
+                    x = x.pin_memory()
+                    y = y.pin_memory()
+                    
+                self.queue.put((x, y))
+            except Exception as e:
+                print(f"Error in prefetch worker: {e}")
+                self.stop_event.set()
+                return
+
+    def next_batch(self):
+        # Get from queue (blocking if empty, which means we wait for IO)
+        x, y = self.queue.get()
+        
+        # Async transfer to GPU
+        if self.device != 'cpu':
+            x = x.to(self.device, non_blocking=True)
+            y = y.to(self.device, non_blocking=True)
+            
+        return x, y
+        
+    def reset(self):
+        # For validation resets, we need to pause/reset the worker
+        # Ideally, we just create a new wrapper for validation each time
+        # or just rely on the queue draining.
+        # Simple hack: Reuse loader but aware that queue has old data?
+        # For val, it's okay to just use loader directly without prefetch if needed,
+        # or rebuild.
+        pass
 
 
 # =============================================================================
@@ -248,7 +310,7 @@ def main():
         print(f"Gradient accumulation steps: {grad_accum_steps}")
         print(f"Effective batch: {B * T * grad_accum_steps * ddp_world_size:,} tokens")
 
-    train_loader = DataLoaderLite(
+    train_loader_inner = DataLoaderLite(
         B=B, T=T, 
         process_rank=ddp_rank, 
         num_processes=ddp_world_size,
@@ -256,7 +318,7 @@ def main():
         data_root=args.shards_dir,
         master_process=master_process
     )
-    val_loader = DataLoaderLite(
+    val_loader_inner = DataLoaderLite(
         B=B, T=T,
         process_rank=ddp_rank,
         num_processes=ddp_world_size,
@@ -264,6 +326,10 @@ def main():
         data_root=args.shards_dir,
         master_process=master_process
     )
+    
+    # Wrap with prefetcher (only for training is critical, but val helps too)
+    train_loader = PrefetchedWrapper(train_loader_inner, device)
+    val_loader = val_loader_inner # Keep val simple or wrap if needed
 
     # =========================================================================
     # OPTIMIZER SETUP
