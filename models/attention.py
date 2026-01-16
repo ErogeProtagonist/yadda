@@ -23,12 +23,24 @@ from .rope import RotaryEmbedding, apply_rotary_pos_emb, apply_rotary_pos_emb_si
 
 
 # Optimized kernels are now built-in via SDPA (torch 2.0+)
-try:
-    import torch.nn.attention.flex
-    FLEX_AVAILABLE = hasattr(torch.nn.attention.flex, "flex_attention")
-except (ImportError, AttributeError):
-    FLEX_AVAILABLE = False
+def _check_flex():
+    try:
+        # Try primary path (PyTorch 2.5+)
+        import torch.nn.attention.flex
+        if hasattr(torch.nn.attention.flex, "flex_attention"):
+            return True
+        # Try top-level attention path
+        if hasattr(torch.nn.attention, "flex_attention"):
+            return True
+        # Try higher order ops path
+        import torch.ops
+        if hasattr(torch.ops, "higher_order") and hasattr(torch.ops.higher_order, "flex_attention"):
+            return True
+    except Exception:
+        pass
+    return False
 
+FLEX_AVAILABLE = _check_flex()
 FLASH_MLA_AVAILABLE = True  # We implemented SDPA version of FlashMLA
 
 
