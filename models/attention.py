@@ -705,6 +705,76 @@ class FlashMLAttention(nn.Module):
         return out, None
 
 
+
+class FlashNativeMLAttention(nn.Module):
+    """
+    Experimental MLA using strict flash-attn native implementation.
+    
+    This forces `flash_attn_func` usage even if it involves extra transposes
+    for RoPE compatibility (B, H, S, D) -> (B, S, H, D).
+    
+    Use this to benchmark against default SDPA (FlashMLAttention).
+    """
+    
+    def __init__(self, config: ModelConfig, layer_idx: int):
+        super().__init__()
+        
+        if not FLASH_ATTN_AVAILABLE:
+            raise RuntimeError("flash-attn not available.")
+        
+        self.naive_impl = NaiveMLAttention(config, layer_idx)
+        
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        # Fallback to naive for inference
+        if kv_cache is not None or use_cache:
+            return self.naive_impl(x, position_ids, kv_cache, use_cache)
+            
+        B, S, D = x.shape
+        impl = self.naive_impl
+        
+        # 1. Query Projections
+        # Result: (B, H, S, D)
+        q_content = impl.q_proj(x).view(B, S, impl.n_heads, impl.head_dim).transpose(1, 2)
+        q_rope = impl.q_rope_proj(x).view(B, S, impl.n_heads, impl.rope_dim).transpose(1, 2)
+        q_rope = impl.rope_decoupled.forward_single(q_rope, position_ids)
+        
+        # 2. Key-Value Projections
+        c_kv = impl.kv_down_proj(x)
+        
+        # RoPE Key: (B, H, S, D)
+        k_rope = impl.k_rope_proj(x).unsqueeze(2).transpose(1, 2)
+        k_rope = impl.rope_decoupled.forward_single(k_rope, position_ids)
+        k_rope = k_rope.expand(-1, impl.n_heads, -1, -1)
+        
+        # Content KV: (B, H, S, D)
+        kv_content = impl.kv_up_proj(c_kv).view(B, S, impl.n_heads, 2 * impl.head_dim).transpose(1, 2)
+        k_content, v = kv_content.chunk(2, dim=-1)
+        
+        # 3. Concatenate (B, H, S, D_total)
+        q_full = torch.cat([q_content, q_rope], dim=-1)
+        k_full = torch.cat([k_content, k_rope], dim=-1)
+        
+        # 4. Transpose for FlashAttention: (B, H, S, D) -> (B, S, H, D)
+        q_full = q_full.transpose(1, 2)
+        k_full = k_full.transpose(1, 2)
+        v = v.transpose(1, 2)
+        
+        # 5. FlashAttention (Native)
+        out = flash_attn_func(q_full, k_full, v, causal=True)
+        
+        # Output is (B, S, H, D), so reshape directly
+        out = out.reshape(B, S, D)
+        out = impl.out_proj(out)
+        
+        return out, None
+
+
 # ============================================================================
 # FACTORY FUNCTION
 # ============================================================================
@@ -745,8 +815,14 @@ def get_attention(
             attn_cls = NaiveHybridAttention
     
     elif config.model_type == "mla":
-        if mode == "train" and FLASH_MLA_AVAILABLE:
-            attn_cls = FlashMLAttention
+        if mode == "train":
+            # Priority: FlashNative > SDPA (for testing speed)
+            if FLASH_ATTN_AVAILABLE:
+                attn_cls = FlashNativeMLAttention
+            elif FLASH_MLA_AVAILABLE:
+                attn_cls = FlashMLAttention
+            else:
+                attn_cls = NaiveMLAttention
         else:
             attn_cls = NaiveMLAttention
     
