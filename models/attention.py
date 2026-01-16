@@ -228,6 +228,7 @@ class FlexHybridAttention(nn.Module):
         self.n_heads = config.n_heads
         self.head_dim = config.head_dim
         self.window_size = config.window_size
+        self.block_size = config.block_size  # Fixed training sequence length
         
         self.qkv_proj = nn.Linear(config.d_model, 3 * config.d_model, bias=False)
         self.out_proj = nn.Linear(config.d_model, config.d_model, bias=False)
@@ -235,10 +236,13 @@ class FlexHybridAttention(nn.Module):
         self.rope = RotaryEmbedding(self.head_dim, config.block_size, config.rope_base)
         self.out_proj.RESIDUAL_SCALE_INIT = True
         
-        # Pre-compile the block mask function for this layer
+        # Pre-compute the block mask for training (fixed sequence length)
+        # This is the critical optimization - create_block_mask is expensive!
+        self._cached_block_mask = None
         if not self.is_global:
             self._block_mask_fn = self._create_sliding_window_mask_fn()
-        
+            # Pre-create for training block size (will be populated on first forward)
+    
     def _create_sliding_window_mask_fn(self):
         """Create a mask function for flex_attention."""
         window = self.window_size
@@ -249,6 +253,28 @@ class FlexHybridAttention(nn.Module):
             return (q_idx >= kv_idx) & (q_idx - kv_idx < window)
         
         return sliding_window_mask
+    
+    def _get_block_mask(self, seq_len: int, device: torch.device):
+        """Get cached block mask or create one for the given sequence length."""
+        # Check if we can reuse cached mask (same seq_len)
+        if (self._cached_block_mask is not None and 
+            self._cached_block_mask.shape[-1] == seq_len):
+            return self._cached_block_mask
+        
+        # Create new block mask (expensive operation - should only happen once per unique seq_len)
+        block_mask = create_block_mask(
+            self._block_mask_fn,
+            B=None, H=None,
+            Q_LEN=seq_len, KV_LEN=seq_len,
+            device=device
+        )
+        
+        # Cache it for training (fixed block_size)
+        if seq_len == self.block_size:
+            self._cached_block_mask = block_mask
+            
+        return block_mask
+
     
     def forward(
         self,
@@ -308,12 +334,8 @@ class FlexHybridAttention(nn.Module):
                 # Full causal attention
                 out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
             else:
-                # Use flex_attention with compiled mask
-                block_mask = create_block_mask(
-                    self._block_mask_fn, 
-                    B=None, H=None, 
-                    Q_LEN=S, KV_LEN=S
-                )
+                # Use flex_attention with CACHED block mask (critical for performance)
+                block_mask = self._get_block_mask(S, x.device)
                 out = flex_attention(q, k, v, block_mask=block_mask)
         
         out = out.transpose(1, 2).contiguous().view(B, S, D)
