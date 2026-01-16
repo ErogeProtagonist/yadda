@@ -571,17 +571,25 @@ def get_attention(
     Returns:
         Attention module instance
     """
+    attn_cls = None
+    
     if config.model_type == "hybrid":
         if mode == "train" and FLEX_AVAILABLE:
-            return FlexHybridAttention(config, layer_idx)
+            attn_cls = FlexHybridAttention
         else:
-            return NaiveHybridAttention(config, layer_idx)
+            attn_cls = NaiveHybridAttention
     
     elif config.model_type == "mla":
         if mode == "train" and FLASH_MLA_AVAILABLE:
-            return FlashMLAttention(config, layer_idx)
+            attn_cls = FlashMLAttention
         else:
-            return NaiveMLAttention(config, layer_idx)
+            attn_cls = NaiveMLAttention
     
     else:
         raise ValueError(f"Unknown model type: {config.model_type}")
+        
+    # Debug log for first layer
+    if layer_idx == 0:
+        print(f"Layer 0 Attention: {attn_cls.__name__} (mode={mode}, flex_avail={FLEX_AVAILABLE})")
+        
+    return attn_cls(config, layer_idx)
