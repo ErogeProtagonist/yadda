@@ -223,21 +223,25 @@ class Transformer(nn.Module):
         for layer_idx, layer in enumerate(self.layers):
             layer_cache = kv_cache[layer_idx] if kv_cache is not None else None
             
-            # Selective Activation Checkpointing
-            # We checkpoint every even layer (0, 2, 4...) and skip others.
-            # This balances VRAM savings with training speed (less re-computation).
+            # Activation Checkpointing
+            # Hybrid is memory-intensive, so we use full checkpointing. 
+            # MLA is efficient, so we stick with selective (every 2nd layer).
             do_checkpoint = self.training and not use_cache and torch.is_grad_enabled()
-            if do_checkpoint and (layer_idx % 2 == 0):
-                x, layer_new_cache = torch.utils.checkpoint.checkpoint(
-                    layer, 
-                    x, 
-                    position_ids, 
-                    layer_cache, 
-                    use_cache,
-                    use_reentrant=False
-                )
+            if do_checkpoint:
+                if self.config.model_type == "hybrid" or (layer_idx % 2 == 0):
+                    x, layer_new_cache = torch.utils.checkpoint.checkpoint(
+                        layer, 
+                        x, 
+                        position_ids, 
+                        layer_cache, 
+                        use_cache,
+                        use_reentrant=False
+                    )
+                else:
+                    x, layer_new_cache = layer(x, position_ids, layer_cache, use_cache)
             else:
                 x, layer_new_cache = layer(x, position_ids, layer_cache, use_cache)
+
             
             if use_cache:
                 new_cache.append(layer_new_cache)
