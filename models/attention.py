@@ -316,9 +316,9 @@ class NaiveMLAttention(nn.Module):
         # KV down-projection to latent space
         self.kv_down_proj = nn.Linear(config.d_model, self.kv_lora_rank, bias=False)
         
-        # KV up-projections from latent space
-        self.k_up_proj = nn.Linear(self.kv_lora_rank, config.n_heads * config.head_dim, bias=False)
-        self.v_up_proj = nn.Linear(self.kv_lora_rank, config.n_heads * config.head_dim, bias=False)
+        # KV up-projection from latent space (Fused for speed)
+        self.kv_up_proj = nn.Linear(self.kv_lora_rank, 2 * config.n_heads * config.head_dim, bias=False)
+
         
         # Decoupled Key RoPE projection (shared across heads in DeepSeek style)
         self.k_rope_proj = nn.Linear(config.d_model, self.rope_dim, bias=False)
@@ -378,12 +378,13 @@ class NaiveMLAttention(nn.Module):
         
         new_cache = (c_kv, k_rope) if use_cache else None
         
-        # Up-project keys and values from latent space
-        k_content = self.k_up_proj(c_kv)  # (B, S_kv, n_heads * head_dim)
-        k_content = k_content.view(B, -1, self.n_heads, self.head_dim).transpose(1, 2)
+        # Up-project keys and values from latent space (chunking the fused projection)
+        kv_content = self.kv_up_proj(c_kv) # (B, S_kv, 2 * n_heads * head_dim)
+        k_content, v = kv_content.chunk(2, dim=-1)
         
-        v = self.v_up_proj(c_kv)  # (B, S_kv, n_heads * head_dim)
+        k_content = k_content.view(B, -1, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, -1, self.n_heads, self.head_dim).transpose(1, 2)
+
         
         # === Attention Computation ===
         # Concatenate content and RoPE dimensions for query and key
@@ -471,9 +472,10 @@ class FlashMLAttention(nn.Module):
         k_rope = impl.rope_decoupled.forward_single(k_rope, position_ids)
         k_rope = k_rope.expand(-1, impl.n_heads, -1, -1) # (B, nh, S, d_R)
         
-        # Up-project content keys and values
-        k_content = impl.k_up_proj(c_kv).view(B, S, impl.n_heads, impl.head_dim).transpose(1, 2)
-        v = impl.v_up_proj(c_kv).view(B, S, impl.n_heads, impl.head_dim).transpose(1, 2)
+        # Up-project content keys and values (fused)
+        kv_content = impl.kv_up_proj(c_kv).view(B, S, impl.n_heads, 2 * impl.head_dim).transpose(1, 2)
+        k_content, v = kv_content.chunk(2, dim=-1) # (B, nh, S, d_h)
+
         
         # 3. Concatenate Content and RoPE
         # q_full: (B, nh, S, d_h + d_R)

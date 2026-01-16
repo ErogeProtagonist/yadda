@@ -72,22 +72,40 @@ class DataLoaderLite:
     def reset(self):
         self.current_shard = 0
         self.tokens = load_tokens(self.shards[self.current_shard])
+        # In packed mode, we shift by B*T per process to ensure each GPU gets unique chunks
         self.current_position = self.B * self.T * self.process_rank
 
     def next_batch(self):
         B, T = self.B, self.T
-        buf = self.tokens[self.current_position : self.current_position + B * T + 1]
+        
+        # We need B*T + 1 tokens (X is buf[:-1], Y is buf[1:])
+        tokens_needed = B * T + 1
+        
+        # If we don't have enough tokens in the current shard, we must concatenate with the next
+        if self.current_position + tokens_needed > len(self.tokens):
+            # Get remaining tokens from current shard
+            remaining = self.tokens[self.current_position:]
+            
+            # Move to next shard
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
+            self.current_position = 0
+            
+            # Combine remaining with start of next shard
+            buf = torch.cat([remaining, self.tokens[:tokens_needed - len(remaining)]])
+            self.current_position += (tokens_needed - len(remaining))
+        else:
+            buf = self.tokens[self.current_position : self.current_position + tokens_needed]
+            self.current_position += B * T * self.num_processes
+            
         x = (buf[:-1]).view(B, T)
         y = (buf[1:]).view(B, T)
         
-        # Advance position
-        self.current_position += B * T * self.num_processes
-        
-        # Move to next shard if needed
+        # Handle wraparound/shard advance for next call
         if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
             self.current_shard = (self.current_shard + 1) % len(self.shards)
             self.tokens = load_tokens(self.shards[self.current_shard])
-            self.current_position = B * T * self.process_rank
+            self.current_position = self.B * self.T * self.process_rank
             
         return x, y
 
