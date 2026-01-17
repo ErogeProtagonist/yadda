@@ -123,8 +123,10 @@ class DataLoaderLite:
 
 class PrefetchedWrapper:
     """
-    Wraps a DataLoader to prefetch batches in a background thread.
-    Eliminates I/O wait times.
+    OPTIMIZATION: Async Data Prefetching
+    
+    Loads next batch in background thread while GPU processes current batch.
+    Combined with pin_memory() and non_blocking transfers, eliminates I/O stalls.
     """
     def __init__(self, loader, device, prefetch_factor=2):
         self.loader = loader
@@ -140,7 +142,7 @@ class PrefetchedWrapper:
                 # Get next batch from CPU loader
                 x, y = self.loader.next_batch()
                 
-                # Pin memory for faster transfer (if on CPU)
+                # OPTIMIZATION: pin_memory() enables async DMA from CPU->GPU
                 if x.device.type == 'cpu':
                     x = x.pin_memory()
                     y = y.pin_memory()
@@ -155,7 +157,7 @@ class PrefetchedWrapper:
         # Get from queue (blocking if empty, which means we wait for IO)
         x, y = self.queue.get()
         
-        # Async transfer to GPU
+        # OPTIMIZATION: non_blocking=True overlaps transfer with GPU compute
         if self.device != 'cpu':
             x = x.to(self.device, non_blocking=True)
             y = y.to(self.device, non_blocking=True)
