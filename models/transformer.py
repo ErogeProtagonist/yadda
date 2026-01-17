@@ -125,10 +125,11 @@ class Transformer(nn.Module):
     Uses RoPE for positional encoding (no learned positional embeddings).
     """
     
-    def __init__(self, config: ModelConfig, mode: str = "train"):
+    def __init__(self, config: ModelConfig, mode: str = "train", use_checkpointing: bool = True):
         super().__init__()
         self.config = config
         self.mode = mode
+        self.use_checkpointing = use_checkpointing  # Can be disabled for high-VRAM GPUs (H200/B200)
         
         # Token embedding (no positional embeddings - using RoPE)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.d_model)
@@ -230,7 +231,11 @@ class Transformer(nn.Module):
             # OPTIMIZATION: Selective Activation Checkpointing (even layers only)
             # Checkpointing discards activations and recomputes during backward pass.
             # Selective (vs all layers) reduces VRAM by ~40% while maintaining ~95% speed.
-            do_checkpoint = self.training and not use_cache and torch.is_grad_enabled()
+            # Can be disabled for high-VRAM GPUs (H200/B200) to maximize throughput.
+            do_checkpoint = (self.use_checkpointing and 
+                           self.training and 
+                           not use_cache and 
+                           torch.is_grad_enabled())
             if do_checkpoint and (layer_idx % 2 == 0):
                 x, layer_new_cache = torch.utils.checkpoint.checkpoint(
                     layer, 

@@ -195,6 +195,80 @@ def get_lr(step, warmup_steps, max_steps, max_lr, min_lr):
 
 
 # =============================================================================
+# GPU PROFILE DETECTION
+# =============================================================================
+
+def get_gpu_profile():
+    """
+    Detect GPU and return optimal training settings.
+    
+    Returns:
+        dict with keys: name, vram_gb, batch_size, use_checkpointing, profile
+    """
+    if not torch.cuda.is_available():
+        return {
+            "name": "CPU",
+            "vram_gb": 0,
+            "batch_size": 4,
+            "use_checkpointing": True,
+            "profile": "cpu"
+        }
+    
+    # Get GPU properties
+    props = torch.cuda.get_device_properties(0)
+    vram_gb = props.total_memory / (1024**3)
+    name = props.name
+    
+    # Determine profile based on VRAM
+    # B200: 192GB, H200: 141GB, H100: 80GB, A100: 40/80GB, RTX 3090: 24GB
+    if vram_gb >= 180:
+        # B200 (192GB) - No checkpointing needed, max batch size
+        return {
+            "name": name,
+            "vram_gb": vram_gb,
+            "batch_size": 32,
+            "use_checkpointing": False,
+            "profile": "b200"
+        }
+    elif vram_gb >= 130:
+        # H200 (141GB) - No checkpointing needed, large batch size
+        return {
+            "name": name,
+            "vram_gb": vram_gb,
+            "batch_size": 24,
+            "use_checkpointing": False,
+            "profile": "h200"
+        }
+    elif vram_gb >= 70:
+        # H100 (80GB) - Selective checkpointing, standard batch size
+        return {
+            "name": name,
+            "vram_gb": vram_gb,
+            "batch_size": 16,
+            "use_checkpointing": True,
+            "profile": "h100"
+        }
+    elif vram_gb >= 35:
+        # A100-40/80GB - Checkpointing, medium batch
+        return {
+            "name": name,
+            "vram_gb": vram_gb,
+            "batch_size": 12,
+            "use_checkpointing": True,
+            "profile": "a100"
+        }
+    else:
+        # Consumer GPU (RTX 3090, etc) - Full checkpointing, small batch
+        return {
+            "name": name,
+            "vram_gb": vram_gb,
+            "batch_size": 4,
+            "use_checkpointing": True,
+            "profile": "consumer"
+        }
+
+
+# =============================================================================
 # MAIN TRAINING LOOP
 # =============================================================================
 
@@ -212,8 +286,8 @@ def main():
                         help="Validation interval")
     parser.add_argument("--save_interval", type=int, default=5000,
                         help="Checkpoint save interval")
-    parser.add_argument("--batch_size", type=int, default=16,
-                        help="Micro batch size per GPU (16 for 500M on H100, 8 for local 3090)")
+    parser.add_argument("--batch_size", type=int, default=None,
+                        help="Micro batch size per GPU (auto-detected if --auto_optimize)")
     parser.add_argument("--total_batch_size", type=int, default=524288,
                         help="Total batch size in tokens (~0.5M)")
     parser.add_argument("--max_lr", type=float, default=6e-4,
@@ -226,6 +300,10 @@ def main():
                         help="Weight decay")
     parser.add_argument("--compile", action="store_true",
                         help="Use torch.compile")
+    parser.add_argument("--auto_optimize", action="store_true",
+                        help="Auto-detect GPU and use optimal settings (batch size, checkpointing)")
+    parser.add_argument("--no_checkpointing", action="store_true",
+                        help="Disable gradient checkpointing (requires more VRAM, faster training)")
     args = parser.parse_args()
 
     # =========================================================================
@@ -263,6 +341,38 @@ def main():
         torch.cuda.manual_seed(1337)
 
     # =========================================================================
+    # GPU PROFILE AND AUTO-OPTIMIZATION
+    # =========================================================================
+    gpu_profile = get_gpu_profile()
+    
+    # Apply auto-optimization settings
+    if args.auto_optimize:
+        if args.batch_size is None:
+            args.batch_size = gpu_profile["batch_size"]
+        use_checkpointing = gpu_profile["use_checkpointing"]
+        if master_process:
+            print(f"\n{'='*60}")
+            print(f"AUTO-OPTIMIZE: Detected {gpu_profile['name']}")
+            print(f"  VRAM: {gpu_profile['vram_gb']:.1f} GB")
+            print(f"  Profile: {gpu_profile['profile'].upper()}")
+            print(f"  Batch Size: {args.batch_size}")
+            print(f"  Checkpointing: {'Enabled (selective)' if use_checkpointing else 'Disabled'}")
+            print(f"{'='*60}\n")
+    else:
+        # Default batch size if not specified
+        if args.batch_size is None:
+            args.batch_size = 16
+        # Use checkpointing unless explicitly disabled
+        use_checkpointing = not args.no_checkpointing
+        if master_process:
+            print(f"\n{'='*60}")
+            print(f"GPU: {gpu_profile['name']} ({gpu_profile['vram_gb']:.1f} GB)")
+            print(f"Profile: {gpu_profile['profile'].upper()} (use --auto_optimize for auto-tuning)")
+            print(f"Batch Size: {args.batch_size}")
+            print(f"Checkpointing: {'Enabled' if use_checkpointing else 'Disabled'}")
+            print(f"{'='*60}\n")
+
+    # =========================================================================
     # MODEL SETUP
     # =========================================================================
     if master_process:
@@ -283,7 +393,8 @@ def main():
     # Determine mode based on hardware
     mode = "train"  # Will use optimized kernels if available
     
-    model = Transformer(config, mode=mode)
+    # Pass checkpointing flag to model
+    model = Transformer(config, mode=mode, use_checkpointing=use_checkpointing)
     model.to(device)
     
     if args.compile:
